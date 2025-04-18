@@ -192,14 +192,6 @@ class MotionDetector:
             # Ana dikdörtgen
             cv2.rectangle(frame, (int(mx), int(my)), (int(mx + mw), int(my + mh)), (0, 255, 0), 2)
             
-            # Hareket yönü okları
-            mid_x = int(mx + mw/2)
-            arrow_length = 30
-            cv2.arrowedLine(frame, (mid_x, int(my + mh)), (mid_x, int(my + mh - arrow_length)), 
-                           (0, 255, 0), 2, tipLength=0.3)
-            cv2.arrowedLine(frame, (mid_x, int(my)), (mid_x, int(my + arrow_length)), 
-                           (0, 255, 0), 2, tipLength=0.3)
-            
             # Debug bilgisi
             cv2.putText(frame, f"Yogunluk: {int(movement_intensity)}", 
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
