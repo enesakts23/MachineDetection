@@ -41,30 +41,38 @@ class KalmanFilter:
 class MotionDetector:
     def __init__(self):
         self.frame_buffer = deque(maxlen=5)
-        self.min_area = 50  # Daha da küçük alanları algıla
+        self.min_area = 50  # Hassas minimum alan
         self.max_area = 50000
         self.previous_frame = None
         self.frame_count = 0
         self.movement_area = None
-        self.vertical_padding = 30  # Daha hassas dikey padding
+        self.vertical_padding = 30
         self.movement_history = []
-        self.history_length = 15  # Daha uzun hareket geçmişi
+        self.history_length = 15
         self.no_movement_counter = 0
         
         # Hassasiyet parametreleri
-        self.detection_threshold = 1  # En hassas threshold
-        self.blur_size = 1  # Minimum blur
+        self.detection_threshold = 5
+        self.blur_size = 1
         
         self.roi = None
-        self.roi_padding = 10  # Minimum ROI padding
+        self.roi_padding = 10
+        
+        # Yoğun bölge ve uç nokta parametreleri (Tekrar Aktif)
+        self.density_threshold = 0.5  # Orta seviye yoğunluk eşiği
+        self.tip_region_height = 150
+        self.tip_weight = 2.0  # Uç bölge ağırlığı
+        self.min_continuous_frames = 2 # Esnek doğrulama
+        self.movement_verification_buffer = deque(maxlen=5)
         
         self.classifier = RandomForestClassifier(n_estimators=100)
         self.training_data = []
         self.training_labels = []
         
-        # Kalman filtresi ekle
+        # Kalman Filtresi (Tekrar Aktif)
         self.kalman_filter = KalmanFilter()
         self.tracked_points = []
+        self.main_movement_area = None
 
     def preprocess_video(self, video_path, sample_frames=100):
         """Video başlamadan önce hareketli bölgeyi tespit et"""
@@ -127,12 +135,38 @@ class MotionDetector:
         
         return False
 
+    def verify_movement(self, current_rect):
+        """Hareketin gerçek olup olmadığını kontrol et (Tekrar Aktif)"""
+        if not current_rect:
+            self.movement_verification_buffer.append(None)
+            return False
+            
+        self.movement_verification_buffer.append(current_rect)
+        
+        # Son birkaç frame'deki hareket konumlarını kontrol et
+        valid_rects = [r for r in self.movement_verification_buffer if r is not None]
+        if len(valid_rects) < self.min_continuous_frames:
+            return False
+            
+        # Hareketin tutarlılığını kontrol et
+        x_coords = [r[0] for r in valid_rects]
+        y_coords = [r[1] for r in valid_rects]
+        
+        # Konum değişiminin tutarlı olup olmadığını kontrol et
+        x_diff = max(x_coords) - min(x_coords)
+        y_diff = max(y_coords) - min(y_coords)
+        
+        # Ani sıçramalar varsa hareketi reddet (Esnek tolerans)
+        return x_diff < 100 and y_diff < 100
+
     def detect_vertical_movement(self, frame):
+        # ROI Kullanımı
+        frame_roi = frame
+        roi_x, roi_y = 0, 0
         if self.roi:
             x, y, w, h = self.roi
             frame_roi = frame[y:y+h, x:x+w]
-        else:
-            frame_roi = frame
+            roi_x, roi_y = x, y
         
         gray = cv2.cvtColor(frame_roi, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (self.blur_size, self.blur_size), 0)
@@ -145,58 +179,98 @@ class MotionDetector:
         _, thresh = cv2.threshold(frame_diff, self.detection_threshold, 255, cv2.THRESH_BINARY)
         
         # Dikey hareketi vurgula
-        kernel_vertical = np.ones((5, 1), np.uint8)  # Daha ince dikey kernel
+        kernel_vertical = np.ones((5, 1), np.uint8)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_vertical)
         thresh = cv2.dilate(thresh, kernel_vertical, iterations=1)
         
         contours = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours = imutils.grab_contours(contours)
         
-        movement_detected = False
-        current_points = []
-        
+        # *** Filtreleme ve Yoğunluk Analizi (Tekrar Aktif) ***
+        valid_contours = []
         for contour in contours:
             area = cv2.contourArea(contour)
             if self.min_area < area < self.max_area:
-                movement_detected = True
-                
-                # Her kontur için merkez noktası hesapla
-                M = cv2.moments(contour)
-                if M["m00"] != 0:
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                    current_points.append((cx, cy))
-                
-                # Kontur analizi
-                x, y, w, h = cv2.boundingRect(contour)
-                if self.roi:
-                    roi_x, roi_y, _, _ = self.roi
-                    x += roi_x
-                    y += roi_y
-                
-                # Kalman filtresi ile tahmin
-                if current_points:
-                    predicted_point = self.kalman_filter.update(current_points[-1])
-                    self.tracked_points.append(predicted_point)
-                    
-                    # Son 5 noktayı kullanarak hareket yönünü belirle
-                    if len(self.tracked_points) > 5:
-                        self.tracked_points.pop(0)
-                    
-                    # Hareket alanını güncelle
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 1)
-                    
-                    # Merkez noktasını işaretle
-                    cv2.circle(frame, predicted_point, 2, (0, 0, 255), -1)
+                _, y_coords = contour.reshape(-1, 2).T
+                bottom_y = np.max(y_coords)
+                valid_contours.append((area, bottom_y, contour))
         
-        if movement_detected:
-            self.no_movement_counter = 0
+        # Alt noktaya göre sırala
+        valid_contours.sort(key=lambda x: x[1], reverse=True)
+        
+        height, width = frame.shape[:2]
+        density_map = np.zeros((height, width), dtype=np.float32)
+        
+        movement_rects = []
+        current_points = []
+        
+        bottom_region = height - self.tip_region_height
+        
+        # Konturları işle ve yoğunluk haritası oluştur
+        for _, bottom_y, contour in valid_contours[:10]:
+            x_c, y_c, w_c, h_c = cv2.boundingRect(contour)
+            
+            # ROI ofseti ekle
+            x_global = x_c + roi_x
+            y_global = y_c + roi_y
+            
+            weight = self.tip_weight if y_global + h_c > bottom_region else 1.0
+            
+            M = cv2.moments(contour)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"]) + roi_x # Global cx
+                cy = int(M["m01"] / M["m00"]) + roi_y # Global cy
+                current_points.append((cx, cy))
+                
+                cv2.rectangle(density_map, (x_global, y_global), (x_global + w_c, y_global + h_c), weight, -1)
+            
+            movement_rects.append((x_global, y_global, w_c, h_c, weight))
+        
+        # En yoğun bölgeyi bul ve filtrele
+        final_rect_to_draw = None
+        if len(movement_rects) > 0:
+            density_map = cv2.GaussianBlur(density_map, (15, 15), 0)
+            density_map = cv2.normalize(density_map, None, 0, 1, cv2.NORM_MINMAX)
+            
+            # Üst bölgeyi bastır
+            density_map[:-self.tip_region_height] *= 0.5
+            
+            max_val = np.max(density_map)
+            if max_val > self.density_threshold:
+                y_dense, x_dense = np.unravel_index(np.argmax(density_map), density_map.shape)
+                
+                # Yoğun bölgedeki en alttaki dikdörtgeni bul
+                dense_rects = []
+                for rect in movement_rects:
+                    rx, ry, rw, rh, weight = rect
+                    # Yoğunluk merkezine yakınlık kontrolü
+                    if abs(x_dense - (rx + rw/2)) < rw*1.5 and abs(y_dense - (ry + rh/2)) < rh*1.5:
+                        if ry + rh > bottom_region: # Alt bölgedeyse öncelik ver
+                            dense_rects.insert(0, (rx, ry, rw, rh))
+                
+                if dense_rects:
+                    # En alttaki doğrulanmış dikdörtgeni seç
+                    for r in dense_rects:
+                        if self.verify_movement(r):
+                            final_rect_to_draw = r
+                            break # İlk doğrulanmış olanı al
+        
+        # Sadece son, doğrulanmış hareketi çiz
+        if final_rect_to_draw:
+            x, y, w, h = final_rect_to_draw
+            tip_point = (int(x + w/2), int(y + h))
+            
+            predicted_point = self.kalman_filter.update(tip_point)
+            self.tracked_points.append(predicted_point)
+            if len(self.tracked_points) > 5:
+                self.tracked_points.pop(0)
+                
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2) # Yeşil
+            cv2.circle(frame, predicted_point, 2, (0, 0, 255), -1) # Kırmızı
         else:
-            self.no_movement_counter += 1
-            if self.no_movement_counter > 5:
-                self.tracked_points = []
-                self.kalman_filter.initialized = False
-        
+            # Eğer doğrulanan hareket yoksa, doğrulama buffer'ını temizle
+            self.verify_movement(None)
+
         # Debug görüntüsü
         debug_thresh = cv2.resize(thresh, (160, 120))
         frame[10:130, frame.shape[1]-170:frame.shape[1]-10] = \
