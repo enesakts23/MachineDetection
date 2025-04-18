@@ -6,31 +6,67 @@ import pickle
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 
+class KalmanFilter:
+    def __init__(self):
+        self.kalman = cv2.KalmanFilter(4, 2)
+        self.kalman.measurementMatrix = np.array([[1, 0, 0, 0],
+                                                [0, 1, 0, 0]], np.float32)
+        self.kalman.transitionMatrix = np.array([[1, 0, 1, 0],
+                                               [0, 1, 0, 1],
+                                               [0, 0, 1, 0],
+                                               [0, 0, 0, 1]], np.float32)
+        self.kalman.processNoiseCov = np.array([[1, 0, 0, 0],
+                                              [0, 1, 0, 0],
+                                              [0, 0, 1, 0],
+                                              [0, 0, 0, 1]], np.float32) * 0.03
+        self.initialized = False
+
+    def update(self, point):
+        measurement = np.array([[np.float32(point[0])], [np.float32(point[1])]])
+        
+        if not self.initialized:
+            self.kalman.statePre = np.array([[np.float32(point[0])],
+                                           [np.float32(point[1])],
+                                           [0], [0]], np.float32)
+            self.kalman.statePost = np.array([[np.float32(point[0])],
+                                            [np.float32(point[1])],
+                                            [0], [0]], np.float32)
+            self.initialized = True
+            
+        prediction = self.kalman.predict()
+        estimated = self.kalman.correct(measurement)
+        
+        return (int(estimated[0][0]), int(estimated[1][0]))
+
 class MotionDetector:
     def __init__(self):
         self.frame_buffer = deque(maxlen=5)
-        self.min_area = 500  # Daha küçük alanları da algıla
+        self.min_area = 50  # Daha da küçük alanları algıla
         self.max_area = 50000
         self.previous_frame = None
         self.frame_count = 0
         self.movement_area = None
-        self.vertical_padding = 150
+        self.vertical_padding = 30  # Daha hassas dikey padding
         self.movement_history = []
-        self.history_length = 5
+        self.history_length = 15  # Daha uzun hareket geçmişi
         self.no_movement_counter = 0
         
         # Hassasiyet parametreleri
-        self.detection_threshold = 10  # Daha hassas threshold
-        self.blur_size = 3  # Daha az blur
+        self.detection_threshold = 1  # En hassas threshold
+        self.blur_size = 1  # Minimum blur
         
-        self.roi = None  # Tespit edilen hareket bölgesi
-        self.roi_padding = 50  # ROI için ek padding
+        self.roi = None
+        self.roi_padding = 10  # Minimum ROI padding
         
         self.classifier = RandomForestClassifier(n_estimators=100)
         self.training_data = []
         self.training_labels = []
+        
+        # Kalman filtresi ekle
+        self.kalman_filter = KalmanFilter()
+        self.tracked_points = []
 
-    def preprocess_video(self, video_path, sample_frames=50):
+    def preprocess_video(self, video_path, sample_frames=100):
         """Video başlamadan önce hareketli bölgeyi tespit et"""
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -92,14 +128,12 @@ class MotionDetector:
         return False
 
     def detect_vertical_movement(self, frame):
-        # ROI'yi kullan
         if self.roi:
             x, y, w, h = self.roi
             frame_roi = frame[y:y+h, x:x+w]
         else:
             frame_roi = frame
         
-        # Frame'i griye çevir
         gray = cv2.cvtColor(frame_roi, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (self.blur_size, self.blur_size), 0)
         
@@ -107,99 +141,61 @@ class MotionDetector:
             self.previous_frame = gray
             return frame
             
-        # Frame farkını hesapla
         frame_diff = cv2.absdiff(self.previous_frame, gray)
-        
-        # Threshold uygula
         _, thresh = cv2.threshold(frame_diff, self.detection_threshold, 255, cv2.THRESH_BINARY)
         
         # Dikey hareketi vurgula
-        kernel_vertical = np.ones((7, 3), np.uint8)
+        kernel_vertical = np.ones((5, 1), np.uint8)  # Daha ince dikey kernel
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_vertical)
-        thresh = cv2.dilate(thresh, kernel_vertical, iterations=2)
+        thresh = cv2.dilate(thresh, kernel_vertical, iterations=1)
         
-        # Konturları bul
         contours = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours = imutils.grab_contours(contours)
         
         movement_detected = False
+        current_points = []
         
-        if len(contours) > 0:
-            # Tüm konturları birleştir
-            all_points = np.vstack([cont.reshape(-1, 2) for cont in contours])
-            x_local, y_local, w_local, h_local = cv2.boundingRect(all_points)
-            
-            # ROI koordinatlarını global koordinatlara çevir
-            if self.roi:
-                roi_x, roi_y, _, _ = self.roi
-                x = x_local + roi_x
-                y = y_local + roi_y
-                w = w_local
-                h = h_local
-            else:
-                x, y, w, h = x_local, y_local, w_local, h_local
-            
-            area = w * h
+        for contour in contours:
+            area = cv2.contourArea(contour)
             if self.min_area < area < self.max_area:
                 movement_detected = True
                 
-                # Dikey padding ekle
-                y = max(0, y - self.vertical_padding)
-                h = min(frame.shape[0] - y, h + 2 * self.vertical_padding)
+                # Her kontur için merkez noktası hesapla
+                M = cv2.moments(contour)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    current_points.append((cx, cy))
                 
-                # Hareket geçmişine ekle
-                self.movement_history.append((x, y, w, h))
-                if len(self.movement_history) > self.history_length:
-                    self.movement_history.pop(0)
+                # Kontur analizi
+                x, y, w, h = cv2.boundingRect(contour)
+                if self.roi:
+                    roi_x, roi_y, _, _ = self.roi
+                    x += roi_x
+                    y += roi_y
                 
-                # Hareket alanını güncelle
-                if self.movement_area is None:
-                    self.movement_area = (x, y, w, h)
-                else:
-                    mx, my, mw, mh = self.movement_area
-                    # Yeni konuma daha fazla ağırlık ver
-                    self.movement_area = (
-                        int(0.1 * mx + 0.9 * x),
-                        int(0.1 * my + 0.9 * y),
-                        int(0.1 * mw + 0.9 * w),
-                        int(0.1 * mh + 0.9 * h)
-                    )
-                self.no_movement_counter = 0
+                # Kalman filtresi ile tahmin
+                if current_points:
+                    predicted_point = self.kalman_filter.update(current_points[-1])
+                    self.tracked_points.append(predicted_point)
+                    
+                    # Son 5 noktayı kullanarak hareket yönünü belirle
+                    if len(self.tracked_points) > 5:
+                        self.tracked_points.pop(0)
+                    
+                    # Hareket alanını güncelle
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 1)
+                    
+                    # Merkez noktasını işaretle
+                    cv2.circle(frame, predicted_point, 2, (0, 0, 255), -1)
         
-        if not movement_detected:
+        if movement_detected:
+            self.no_movement_counter = 0
+        else:
             self.no_movement_counter += 1
-            if self.no_movement_counter > 2 and self.movement_area is not None:
-                mx, my, mw, mh = self.movement_area
-                # Hızlı küçültme
-                self.movement_area = (
-                    mx,
-                    my,
-                    int(mw * 0.6),  # Daha da hızlı küçült
-                    int(mh * 0.6)
-                )
-                
-                if mw * 0.6 < 50 or mh * 0.6 < 50:
-                    self.movement_area = None
-                    self.movement_history.clear()
-        
-        # Görselleştirme
-        if self.movement_area is not None:
-            mx, my, mw, mh = self.movement_area
-            
-            # Hareket yoğunluğu
-            movement_intensity = np.sum(thresh) / 255.0
-            
-            # Ana dikdörtgen
-            cv2.rectangle(frame, (int(mx), int(my)), (int(mx + mw), int(my + mh)), (0, 255, 0), 2)
-            
-            # Debug bilgisi
-            cv2.putText(frame, f"Yogunluk: {int(movement_intensity)}", 
-                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        # ROI'yi göster
-        if self.roi:
-            rx, ry, rw, rh = self.roi
-            cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh), (255, 0, 0), 1)
+            if self.no_movement_counter > 5:
+                self.tracked_points = []
+                self.kalman_filter.initialized = False
         
         # Debug görüntüsü
         debug_thresh = cv2.resize(thresh, (160, 120))
