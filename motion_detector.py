@@ -8,57 +8,142 @@ from sklearn.ensemble import RandomForestClassifier
 
 class MotionDetector:
     def __init__(self):
-        self.frame_buffer = deque(maxlen=5)  # Daha kısa buffer
-        self.min_area = 100  # Çok daha düşük minimum alan
+        self.frame_buffer = deque(maxlen=5)
+        self.min_area = 500  # Daha küçük alanları da algıla
+        self.max_area = 50000
         self.previous_frame = None
         self.frame_count = 0
         self.movement_area = None
-        self.vertical_padding = 150  # Daha fazla dikey padding
-        self.movement_history = []  # Hareket geçmişi
-        self.history_length = 10  # Son 10 hareketin geçmişi
+        self.vertical_padding = 150
+        self.movement_history = []
+        self.history_length = 5
+        self.no_movement_counter = 0
         
-        self.min_area = 2000      
-        self.max_area = 50000     
+        # Hassasiyet parametreleri
+        self.detection_threshold = 10  # Daha hassas threshold
+        self.blur_size = 3  # Daha az blur
+        
+        self.roi = None  # Tespit edilen hareket bölgesi
+        self.roi_padding = 50  # ROI için ek padding
         
         self.classifier = RandomForestClassifier(n_estimators=100)
         self.training_data = []
         self.training_labels = []
-        self.roi = None
-        self.selecting_roi = False
+
+    def preprocess_video(self, video_path, sample_frames=50):
+        """Video başlamadan önce hareketli bölgeyi tespit et"""
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_indices = np.linspace(0, total_frames-1, sample_frames, dtype=int)
+        
+        frames = []
+        diffs = []
+        
+        # Frame'leri topla
+        for idx in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray = cv2.GaussianBlur(gray, (self.blur_size, self.blur_size), 0)
+                frames.append(gray)
+                
+                if len(frames) > 1:
+                    diff = cv2.absdiff(frames[-1], frames[-2])
+                    diffs.append(diff)
+        
+        cap.release()
+        
+        if not diffs:
+            return None
+            
+        # Tüm frame farklarını birleştir
+        motion_map = np.zeros_like(diffs[0], dtype=np.float32)
+        for diff in diffs:
+            _, thresh = cv2.threshold(diff, self.detection_threshold, 255, cv2.THRESH_BINARY)
+            motion_map += thresh.astype(np.float32)
+        
+        # Hareket haritasını normalize et
+        motion_map = (motion_map / len(diffs)).astype(np.uint8)
+        
+        # Dikey hareketi vurgula
+        kernel_vertical = np.ones((7, 3), np.uint8)
+        motion_map = cv2.morphologyEx(motion_map, cv2.MORPH_OPEN, kernel_vertical)
+        motion_map = cv2.dilate(motion_map, kernel_vertical, iterations=2)
+        
+        # En aktif bölgeyi bul
+        contours = cv2.findContours(motion_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = imutils.grab_contours(contours)
+        
+        if contours:
+            # En büyük konturu bul
+            max_contour = max(contours, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(max_contour)
+            
+            # ROI'yi genişlet
+            x = max(0, x - self.roi_padding)
+            y = max(0, y - self.roi_padding)
+            w = min(motion_map.shape[1] - x, w + 2 * self.roi_padding)
+            h = min(motion_map.shape[0] - y, h + 2 * self.roi_padding)
+            
+            self.roi = (x, y, w, h)
+            return True
+        
+        return False
 
     def detect_vertical_movement(self, frame):
-        # Frame'i griye çevir ve ön işleme
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)  # Daha az blur
+        # ROI'yi kullan
+        if self.roi:
+            x, y, w, h = self.roi
+            frame_roi = frame[y:y+h, x:x+w]
+        else:
+            frame_roi = frame
+        
+        # Frame'i griye çevir
+        gray = cv2.cvtColor(frame_roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (self.blur_size, self.blur_size), 0)
         
         if self.previous_frame is None:
             self.previous_frame = gray
             return frame
             
-        # Frame farkını bul ve threshold uygula
+        # Frame farkını hesapla
         frame_diff = cv2.absdiff(self.previous_frame, gray)
-        _, thresh = cv2.threshold(frame_diff, 15, 255, cv2.THRESH_BINARY)  # Daha düşük threshold
         
-        # Morfolojik işlemler
-        kernel_dilate = np.ones((5, 7), np.uint8)  # Dikey yönde daha büyük kernel
-        kernel_erode = np.ones((3, 3), np.uint8)
+        # Threshold uygula
+        _, thresh = cv2.threshold(frame_diff, self.detection_threshold, 255, cv2.THRESH_BINARY)
         
-        thresh = cv2.erode(thresh, kernel_erode, iterations=1)
-        thresh = cv2.dilate(thresh, kernel_dilate, iterations=2)
+        # Dikey hareketi vurgula
+        kernel_vertical = np.ones((7, 3), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_vertical)
+        thresh = cv2.dilate(thresh, kernel_vertical, iterations=2)
         
         # Konturları bul
         contours = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours = imutils.grab_contours(contours)
         
-        # Tüm konturları birleştir
+        movement_detected = False
+        
         if len(contours) > 0:
+            # Tüm konturları birleştir
             all_points = np.vstack([cont.reshape(-1, 2) for cont in contours])
-            x, y, w, h = cv2.boundingRect(all_points)
+            x_local, y_local, w_local, h_local = cv2.boundingRect(all_points)
             
-            # Çok küçük alanları filtrele
+            # ROI koordinatlarını global koordinatlara çevir
+            if self.roi:
+                roi_x, roi_y, _, _ = self.roi
+                x = x_local + roi_x
+                y = y_local + roi_y
+                w = w_local
+                h = h_local
+            else:
+                x, y, w, h = x_local, y_local, w_local, h_local
+            
             area = w * h
-            if area > self.min_area:
-                # Dikey yönde genişlet
+            if self.min_area < area < self.max_area:
+                movement_detected = True
+                
+                # Dikey padding ekle
                 y = max(0, y - self.vertical_padding)
                 h = min(frame.shape[0] - y, h + 2 * self.vertical_padding)
                 
@@ -67,49 +152,64 @@ class MotionDetector:
                 if len(self.movement_history) > self.history_length:
                     self.movement_history.pop(0)
                 
-                # Son hareketlerin ortalamasını al
-                if len(self.movement_history) > 0:
-                    avg_x = int(np.mean([m[0] for m in self.movement_history]))
-                    avg_y = int(np.mean([m[1] for m in self.movement_history]))
-                    avg_w = int(np.mean([m[2] for m in self.movement_history]))
-                    avg_h = int(np.mean([m[3] for m in self.movement_history]))
-                    
-                    # Hareket alanını yumuşak geçişle güncelle
-                    if self.movement_area is None:
-                        self.movement_area = (avg_x, avg_y, avg_w, avg_h)
-                    else:
-                        mx, my, mw, mh = self.movement_area
-                        self.movement_area = (
-                            int(0.8 * mx + 0.2 * avg_x),
-                            int(0.8 * my + 0.2 * avg_y),
-                            int(0.8 * mw + 0.2 * avg_w),
-                            int(0.8 * mh + 0.2 * avg_h)
-                        )
+                # Hareket alanını güncelle
+                if self.movement_area is None:
+                    self.movement_area = (x, y, w, h)
+                else:
+                    mx, my, mw, mh = self.movement_area
+                    # Yeni konuma daha fazla ağırlık ver
+                    self.movement_area = (
+                        int(0.1 * mx + 0.9 * x),
+                        int(0.1 * my + 0.9 * y),
+                        int(0.1 * mw + 0.9 * w),
+                        int(0.1 * mh + 0.9 * h)
+                    )
+                self.no_movement_counter = 0
         
-        # Hareket alanını çiz
+        if not movement_detected:
+            self.no_movement_counter += 1
+            if self.no_movement_counter > 2 and self.movement_area is not None:
+                mx, my, mw, mh = self.movement_area
+                # Hızlı küçültme
+                self.movement_area = (
+                    mx,
+                    my,
+                    int(mw * 0.6),  # Daha da hızlı küçült
+                    int(mh * 0.6)
+                )
+                
+                if mw * 0.6 < 50 or mh * 0.6 < 50:
+                    self.movement_area = None
+                    self.movement_history.clear()
+        
+        # Görselleştirme
         if self.movement_area is not None:
             mx, my, mw, mh = self.movement_area
             
-            # Hareket yoğunluğunu göster
+            # Hareket yoğunluğu
             movement_intensity = np.sum(thresh) / 255.0
-            color = (0, min(255, movement_intensity/100), 0)
             
             # Ana dikdörtgen
-            cv2.rectangle(frame, (mx, my), (mx + mw, my + mh), (0, 165, 255), 2)
+            cv2.rectangle(frame, (int(mx), int(my)), (int(mx + mw), int(my + mh)), (0, 255, 0), 2)
             
-            # Hareket yönünü gösteren oklar
-            mid_x = mx + mw // 2
+            # Hareket yönü okları
+            mid_x = int(mx + mw/2)
             arrow_length = 30
-            cv2.arrowedLine(frame, (mid_x, my + mh), (mid_x, my + mh - arrow_length), 
-                           color, 2, tipLength=0.3)
-            cv2.arrowedLine(frame, (mid_x, my), (mid_x, my + arrow_length), 
-                           color, 2, tipLength=0.3)
+            cv2.arrowedLine(frame, (mid_x, int(my + mh)), (mid_x, int(my + mh - arrow_length)), 
+                           (0, 255, 0), 2, tipLength=0.3)
+            cv2.arrowedLine(frame, (mid_x, int(my)), (mid_x, int(my + arrow_length)), 
+                           (0, 255, 0), 2, tipLength=0.3)
             
             # Debug bilgisi
             cv2.putText(frame, f"Yogunluk: {int(movement_intensity)}", 
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
-        # Görsel debug için threshold'u küçük pencerede göster
+        # ROI'yi göster
+        if self.roi:
+            rx, ry, rw, rh = self.roi
+            cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh), (255, 0, 0), 1)
+        
+        # Debug görüntüsü
         debug_thresh = cv2.resize(thresh, (160, 120))
         frame[10:130, frame.shape[1]-170:frame.shape[1]-10] = \
             cv2.cvtColor(debug_thresh, cv2.COLOR_GRAY2BGR)
@@ -184,8 +284,12 @@ class MotionDetector:
             self.classifier = pickle.load(f)
 
 def main():
-    video_path = "pressmachine2.mp4"
+    video_path = "pressmachine4.mp4"
     detector = MotionDetector()
+    
+    print("Hareketli bölge tespit ediliyor...")
+    detector.preprocess_video(video_path)
+    print("Tespit tamamlandı, video başlatılıyor...")
     
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
